@@ -1,0 +1,44 @@
+import os
+import rasterio
+from rasterio.mask import mask
+import geopandas as gpd
+from shapely.geometry import mapping
+
+# Paths
+shapefile_path = "C:/Users/mohak/Downloads/plots_fixed/plots_fixed.shp"
+images_dir = "C:/Users/mohak/OneDrive/Desktop/2023-2024 all bands sen 2"
+output_dir = "C:/Users/mohak/OneDrive/Desktop/2023-2024 output_cropped all bands"
+
+os.makedirs(output_dir, exist_ok=True)
+
+# Load and reproject shapefile to match raster
+plots = gpd.read_file(shapefile_path)
+with rasterio.open(os.path.join(images_dir, os.listdir(images_dir)[0])) as src:
+    image_crs = src.crs
+plots = plots.to_crs(image_crs)
+
+# Loop over plots and images
+for idx, plot in plots.iterrows():
+    plot_id = plot['id'] if 'id' in plot else f"plot_{idx}"
+    geom = [mapping(plot['geometry'])]
+
+    for image_file in os.listdir(images_dir):
+        if image_file.endswith('.tif'):
+            image_path = os.path.join(images_dir, image_file)
+            print(f"Cropping {image_file} for {plot_id}")
+            try:
+                with rasterio.open(image_path) as src:
+                    out_image, out_transform = mask(src, geom, crop=True)
+                    out_meta = src.meta.copy()
+                    out_meta.update({
+                        "driver": "GTiff",
+                        "height": out_image.shape[1],
+                        "width": out_image.shape[2],
+                        "transform": out_transform
+                    })
+
+                    output_path = os.path.join(output_dir, f"{plot_id}_{image_file}")
+                    with rasterio.open(output_path, "w", **out_meta) as dest:
+                        dest.write(out_image)
+            except Exception as e:
+                print(f"Skipping {image_file} for {plot_id}: {e}")

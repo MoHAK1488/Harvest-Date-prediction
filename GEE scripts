@@ -1,0 +1,326 @@
+///This script is designed to export Sentinel-2 RGB images (B4, B3, B2 bands) from Google Earth Engine for a specified date range and region defined by a shapefile
+
+// 1. Load your shapefile
+var table = ee.FeatureCollection("projects/ee-mohakagarwala/assets/plots_fixed");
+
+// 2. Filter Sentinel-2 image collection
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(table)
+  .filterDate('2020-11-01', '2020-11-05')  // Your desired date range
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));  // Filter for low clouds
+
+// 3. Print available dates
+var dates = s2.aggregate_array('system:time_start')
+  .map(function(time) {
+    return ee.Date(time).format('YYYY-MM-dd');
+  });
+
+print('Available Sentinel-2 Image Dates:', dates);
+
+// 4. Function to export an image with its acquisition date as filename
+var exportImage = function(image) {
+  var date = ee.Date(image.get('system:time_start')).format('YYYY-MM-dd');
+  var imageName = ee.String('S2_').cat(date);
+  
+  Export.image.toDrive({
+    image: image.clip(table).select(['B4', 'B3', 'B2']),  // RGB bands
+    description: imageName.getInfo(),  // Task name
+    folder: 'Sentinel_Images',         // Folder in your Google Drive
+    fileNamePrefix: imageName.getInfo(),  // File name
+    region: table.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+};
+
+// 5. Loop through the image collection and create export tasks
+var list = s2.toList(s2.size());
+var count = list.size().getInfo();  // Convert to client-side for iteration
+
+for (var i = 0; i < count; i++) {
+  var image = ee.Image(list.get(i));
+  exportImage(image);
+}
+
+///This script is designed to export multispectral Sentinel-2 images (all relevant spectral bands) for your plot geometries over a date range, clipped to your shapefile, and save them to your Google Drive.
+
+// 1. Load your shapefile
+var table = ee.FeatureCollection("projects/ee-mohakagarwala/assets/plots_fixed");
+
+// 2. Filter Sentinel-2 image collection
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(table)
+  .filterDate('2023-09-01', '2024-03-31')  // Your desired date range
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+// 3. Define valid bands (UInt16 spectral bands)
+var spectralBands = [
+  'B1',  // Aerosol
+  'B2',  // Blue
+  'B3',  // Green
+  'B4',  // Red
+  'B5',  // Red Edge 1
+  'B6',  // Red Edge 2
+  'B7',  // Red Edge 3
+  'B8',  // NIR
+  'B8A', // Narrow NIR
+  'B11', // SWIR 1
+  'B12'  // SWIR 2
+];
+
+// 4. Print available dates
+var dates = s2.aggregate_array('system:time_start')
+  .map(function(time) {
+    return ee.Date(time).format('YYYY-MM-dd');
+  });
+print('Available Sentinel-2 Image Dates:', dates);
+
+// 5. Function to export image with only spectral bands
+var exportImage = function(image) {
+  var date = ee.Date(image.get('system:time_start')).format('YYYY-MM-dd');
+  var imageName = ee.String('S2_').cat(date);
+  
+  Export.image.toDrive({
+    image: image.clip(table).select(spectralBands),
+    description: imageName.getInfo(),
+    folder: 'Sentinel_SpectralBands',
+    fileNamePrefix: imageName.getInfo(),
+    region: table.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+};
+
+// 6. Loop through and export
+var list = s2.toList(s2.size());
+var count = list.size().getInfo();
+for (var i = 0; i < count; i++) {
+  var image = ee.Image(list.get(i));
+  exportImage(image);
+}
+
+
+///This script extracts per-plot NDVI time series data from Sentinel-2 imagery and exports it as a CSV file, with each row containing the NDVI value for one plot on one date.
+
+// 1. Load your plots shapefile
+var plots = ee.FeatureCollection("projects/ee-mohakagarwala/assets/plots_fixed");
+
+// 2. Load Sentinel-2 and compute NDVI
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(plots)
+  .filterDate('2024-09-01', '2025-03-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(function(img) {
+    var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    return ndvi.copyProperties(img, ['system:time_start']);
+  });
+
+// 3. Flatten: for each image, compute NDVI per plot
+var results = s2.map(function(image) {
+  var dateStr = ee.Date(image.get('system:time_start')).format('YYYY-MM-dd');
+  return plots.map(function(plot) {
+    var mean = image.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: plot.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    }).get('NDVI');
+    return plot.set({
+      'date': dateStr,
+      'NDVI': mean
+    });
+  });
+}).flatten();  // Flatten list of lists into a single FeatureCollection
+
+// 4. Export to Drive
+Export.table.toDrive({
+  collection: results,
+  description: 'NDVI_RealDates_PerPlot_2024_2025',
+  folder: 'NDVI_Timeseries',
+  fileFormat: 'CSV'
+});
+
+/// This script computes per-plot time series of the VARI  using Sentinel-2 imagery, and exports the result as a CSV
+
+// 1. Load your plots shapefile
+var plots = ee.FeatureCollection("projects/ee-mohakagarwala/assets/plots_fixed");
+
+// 2. Load Sentinel-2 and compute VARI
+// VARI = (G - R) / (G + R - B) = (B3 - B4) / (B3 + B4 - B2)
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(plots)
+  .filterDate('2024-09-01', '2025-03-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(function(img) {
+    var vari = img.expression(
+      '((G - R) / (G + R - B))', {
+        'G': img.select('B3'),  // Green
+        'R': img.select('B4'),  // Red
+        'B': img.select('B2')   // Blue
+      }).rename('VARI');
+    return vari.copyProperties(img, ['system:time_start']);
+  });
+
+// 3. For each image, compute VARI per plot
+var results = s2.map(function(image) {
+  var dateStr = ee.Date(image.get('system:time_start')).format('YYYY-MM-dd');
+  return plots.map(function(plot) {
+    var mean = image.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: plot.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    }).get('VARI');
+    return plot.set({
+      'date': dateStr,
+      'VARI': mean
+    });
+  });
+}).flatten();
+
+// 4. Export to Drive as CSV
+Export.table.toDrive({
+  collection: results,
+  description: 'VARI_RealDates_PerPlot_2024_2025',
+  folder: 'VARI_Timeseries',
+  fileFormat: 'CSV'
+});
+
+///This script performs a detailed NDVI time-series analysis for a single agricultural plot, aiming to detect the turning point before the largest NDVI drop�a common signal for harvest events.
+
+// 1. Load plot shapefile
+var plots = ee.FeatureCollection("projects/ee-mohakagarwala/assets/plots_fixed");
+
+// 2. Select a single plot by its 'id'
+var plotId = 'plot_10';
+var plot = plots.filter(ee.Filter.eq('id', plotId)).first();
+var plotGeom = plot.geometry();
+
+// 3. Prepare NDVI time-series from Sentinel-2
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(plotGeom)
+  .filterDate('2022-08-01', '2023-03-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(function(image) {
+    var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    return image.addBands(ndvi).select(['NDVI']).copyProperties(image, ['system:time_start']);
+  });
+
+// 4. Compute mean NDVI for each image over the plot
+var withMean = s2.map(function(img) {
+  var mean = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: plotGeom,
+    scale: 10,
+    maxPixels: 1e8
+  }).get('NDVI');
+  return img.set('mean_ndvi', mean);
+});
+
+// 5. Filter out images where NDVI is null
+var filtered = withMean.filter(ee.Filter.notNull(['mean_ndvi']));
+
+// 6. Extract NDVI and date list
+var sorted = filtered.sort('system:time_start');
+var ndviList = sorted.aggregate_array('mean_ndvi');
+var dateList = sorted.aggregate_array('system:time_start');
+ // 7. Find minimum and second minimum NDVI index
+var findMinIndexWithFallback = function(ndviList) {
+  ndviList = ee.List(ndviList);
+
+  // Get minimum NDVI and its index
+  var min = ndviList.reduce(ee.Reducer.min());
+  var minIndex = ndviList.indexOf(min);
+
+  // If minIndex == 0, then find second min
+  var secondMinIndex = ee.Algorithms.If(
+    minIndex.eq(0),
+    ndviList.slice(1).reduce(ee.Reducer.min()),  // Get second min value
+    null
+  );
+
+  // If we needed second min, get its index (offset by 1 because we sliced)
+  var adjustedIndex = ee.Algorithms.If(
+    minIndex.eq(0),
+    ndviList.indexOf(secondMinIndex),
+    minIndex
+  );
+
+  return adjustedIndex;
+};
+
+var minIndex = ee.Number(findMinIndexWithFallback(ndviList));
+var minDate = ee.Date(dateList.get(minIndex)).format('YYYY-MM-dd');
+var minNDVI = ndviList.get(minIndex);
+
+print('Final NDVI min index used:', minIndex);
+print('NDVI value at min index:', minNDVI);
+print('Date of min NDVI:', minDate);
+
+
+
+// 8. Improved bump detection (last peak before NDVI min)
+var getLastBumpBeforeMin = function(ndviList, minIndex) {
+  ndviList = ee.List(ndviList);
+  minIndex = ee.Number(minIndex);
+
+  // Loop from minIndex-2 down to 1
+  var indices = ee.List.sequence(minIndex.subtract(2), 1, -1);
+
+  var result = indices.iterate(function(i, prev) {
+    prev = ee.Dictionary(prev);
+    var found = ee.Number(prev.get('found')); // Will be 0 or 1
+    i = ee.Number(i);
+
+    return ee.Algorithms.If(found, prev, ee.Algorithms.If(
+      i.subtract(1).gte(0).and(i.add(1).lt(ndviList.length())),
+      function() {
+        var left = ee.Number(ndviList.get(i.subtract(1)));
+        var center = ee.Number(ndviList.get(i));
+        var right = ee.Number(ndviList.get(i.add(1)));
+
+        var isBump = center.gt(left).and(center.gt(right))
+          .and(center.subtract(left).gt(0.02))
+          .and(center.subtract(right).gt(0.02));
+
+        return ee.Algorithms.If(isBump,
+          ee.Dictionary({found: true, index: i}),
+          prev
+        );
+      }(),
+      prev
+    ));
+  }, ee.Dictionary({found: false, index: null}));
+
+  return ee.Dictionary(result);
+};
+
+// 9. Find bump date
+var bumpResult = getLastBumpBeforeMin(ndviList, minIndex);
+var bumpIndex = bumpResult.get('index');
+var bumpDate = ee.Algorithms.If(
+  bumpResult.get('found'),
+  ee.Date(dateList.get(bumpIndex)).format('YYYY-MM-dd'),
+  'No bump found'
+);
+
+print('Turning Point Date (last bump before NDVI drop):', bumpDate);
+
+// 10. Plot the NDVI time series
+var chart = ui.Chart.image.series({
+  imageCollection: s2,
+  region: plotGeom,
+  reducer: ee.Reducer.mean(),
+  scale: 10,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'NDVI Time Series for Plot ' + plotId,
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'NDVI'},
+  lineWidth: 2,
+  pointSize: 4
+});
+
+print(chart);
+
+
