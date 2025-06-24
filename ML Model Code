@@ -1,0 +1,187 @@
+# ------------------------------------------------------------------------------
+# STEP 0: Import libraries
+# ------------------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_absolute_error
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from scipy.interpolate import interp1d
+
+
+# ------------------------------------------------------------------------------
+# STEP 1: Load NDVI & VARI Data (Interpolated)
+# ------------------------------------------------------------------------------
+seasons = ['2022_2023', '2023_2024', '2024_2025']
+
+ndvi_files = [f'/NDVI_RealDates_PerPlot_{s}.csv' for s in seasons]
+vari_files = [f'/VARI_RealDates_PerPlot_{s}.csv' for s in seasons]
+harvest_files = [f'/Harvest_Dates_{s}.csv' for s in seasons]
+
+ndvi_all, vari_all, harvest_all = [], [], []
+
+for ndvi_file, vari_file, harvest_file, season in zip(ndvi_files, vari_files, harvest_files, seasons):
+    ndvi = pd.read_csv(ndvi_file)
+    vari = pd.read_csv(vari_file)
+    harvest = pd.read_csv(harvest_file)
+
+    ndvi['date'] = pd.to_datetime(ndvi['date'])
+    vari['date'] = pd.to_datetime(vari['date'])
+    harvest['harvest_date'] = pd.to_datetime(harvest['harvest_date'])
+
+    ndvi['season'] = vari['season'] = season
+
+    harvest['harvest_doy'] = harvest['harvest_date'].apply(
+        lambda d: (d - datetime(d.year, 1, 1)).days if d.month >= 8 
+        else (d - datetime(d.year, 1, 1)).days + 365
+    )
+    harvest['season'] = season
+
+    ndvi_all.append(ndvi)
+    vari_all.append(vari)
+    harvest_all.append(harvest)
+
+ndvi_df = pd.concat(ndvi_all, ignore_index=True)
+vari_df = pd.concat(vari_all, ignore_index=True)
+harvest_df = pd.concat(harvest_all, ignore_index=True)
+
+
+# ------------------------------------------------------------------------------
+# STEP 2: Interpolate and Extract Features
+# ------------------------------------------------------------------------------
+def extract_features(group_ndvi, group_vari):
+    plot_id = group_ndvi['id'].iloc[0]
+    season = group_ndvi['season'].iloc[0]
+
+    group_ndvi = group_ndvi.sort_values('date')
+    group_vari = group_vari.sort_values('date')
+
+    doy_ndvi = np.array([(d - datetime(d.year, 1, 1)).days for d in group_ndvi['date']])
+    doy_vari = np.array([(d - datetime(d.year, 1, 1)).days for d in group_vari['date']])
+
+    ndvi = group_ndvi['NDVI'].values
+    vari = group_vari['VARI'].values
+
+    interp_days = np.linspace(213, 455, 40)  # Aug 1 to Mar 31
+
+    try:
+        ndvi_interp = interp1d(doy_ndvi, ndvi, kind='cubic', fill_value='extrapolate')(interp_days)
+    except:
+        ndvi_interp = np.interp(interp_days, doy_ndvi, ndvi)
+
+    try:
+        vari_interp = interp1d(doy_vari, vari, kind='cubic', fill_value='extrapolate')(interp_days)
+    except:
+        vari_interp = np.interp(interp_days, doy_vari, vari)
+
+    features = {
+        'id': plot_id,
+        'season': season,
+        'ndvi_max': ndvi.max(),
+        'ndvi_mean': ndvi.mean(),
+        'ndvi_std': ndvi.std(),
+        'ndvi_slope': (ndvi[-1] - ndvi[0]) / (doy_ndvi[-1] - doy_ndvi[0] + 1e-6),
+        'ndvi_peak_day': doy_ndvi[np.argmax(ndvi)],
+        'vari_max': vari.max(),
+        'vari_mean': vari.mean(),
+        'vari_std': vari.std(),
+        'vari_slope': (vari[-1] - vari[0]) / (doy_vari[-1] - doy_vari[0] + 1e-6),
+        'vari_peak_day': doy_vari[np.argmax(vari)]
+    }
+
+    for i in range(40):
+        features[f'ndvi_interp_{i}'] = ndvi_interp[i]
+        features[f'vari_interp_{i}'] = vari_interp[i]
+
+    return pd.Series(features)
+
+
+features = []
+for (pid, season), group_ndvi in ndvi_df.groupby(['id', 'season']):
+    group_vari = vari_df[(vari_df['id'] == pid) & (vari_df['season'] == season)]
+    if group_vari.empty:
+        continue
+    features.append(extract_features(group_ndvi, group_vari))
+
+features_df = pd.DataFrame(features)
+
+
+# ------------------------------------------------------------------------------
+# STEP 3: Merge Features with Ground Truth
+# ------------------------------------------------------------------------------
+merged = pd.merge(features_df, harvest_df[['id', 'season', 'harvest_doy']], on=['id', 'season'])
+
+
+# ------------------------------------------------------------------------------
+# STEP 4: Outlier Removal
+# ------------------------------------------------------------------------------
+q1 = merged['harvest_doy'].quantile(0.25)
+q3 = merged['harvest_doy'].quantile(0.75)
+iqr = q3 - q1
+lower = q1 - 1.5 * iqr
+upper = q3 + 1.5 * iqr
+merged = merged[(merged['harvest_doy'] >= lower) & (merged['harvest_doy'] <= upper)]
+
+
+# ------------------------------------------------------------------------------
+# STEP 5: Split and Scale
+# ------------------------------------------------------------------------------
+X = merged.drop(columns=['id', 'season', 'harvest_doy'])
+y = merged['harvest_doy']
+
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+
+# ------------------------------------------------------------------------------
+# STEP 6: Train Gradient Boosting
+# ------------------------------------------------------------------------------
+model = GradientBoostingRegressor(random_state=42)
+param_grid = {
+    'n_estimators': [300, 500],
+    'max_depth': [5, 10],
+    'min_samples_leaf': [1, 5],
+}
+
+grid = GridSearchCV(model, param_grid, scoring='neg_mean_absolute_error', cv=5, n_jobs=-1)
+grid.fit(X_train_scaled, y_train)
+
+print("Best parameters:", grid.best_params_)
+
+model = grid.best_estimator_
+
+
+# ------------------------------------------------------------------------------
+# STEP 7: Evaluate
+# ------------------------------------------------------------------------------
+train_pred = model.predict(X_train_scaled)
+val_pred = model.predict(X_val_scaled)
+test_pred = model.predict(X_test_scaled)
+
+print(f"Train MAE: {mean_absolute_error(y_train, train_pred):.2f} days")
+print(f"Val MAE: {mean_absolute_error(y_val, val_pred):.2f} days")
+print(f"Test MAE: {mean_absolute_error(y_test, test_pred):.2f} days")
+
+
+# ------------------------------------------------------------------------------
+# STEP 8: Plot Results
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(6, 6))
+plt.scatter(y_test, test_pred, alpha=0.6, edgecolor='k')
+plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], 'r--', label='Ideal Fit')
+plt.xlabel("Actual Harvest DOY")
+plt.ylabel("Predicted Harvest DOY")
+plt.title("Harvest DOY Prediction with NDVI + VARI")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
